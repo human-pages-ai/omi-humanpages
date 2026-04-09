@@ -1,0 +1,17 @@
+{
+  "id": "humanpages-hire",
+  "name": "Human Pages — Hire Real Humans",
+  "author": "Human Pages",
+  "description": "Search, hire, and pay real humans for tasks — plumbers, designers, tutors, anything. Powered by humanpages.ai.",
+  "image": "/plugins/logos/humanpages.png",
+  "capabilities": ["external_integration", "chat"],
+  "chat_prompt": "You help users find and hire real human service providers through Human Pages (humanpages.ai). When a user wants to get something done — hire a photographer, find a plumber, get design work — use the available tools to search for providers, post job listings, or send direct offers. Always confirm the budget before creating a listing or sending an offer. Be concise and action-oriented.",
+  "external_integration": {
+    "triggers_on": "memory_creation",
+    "webhook_url": "https://omi.humanpages.ai/webhook",
+    "setup_completed_url": "https://omi.humanpages.ai/setup_check",
+    "setup_instructions_file_path": "/README.md",
+    "chat_tools_manifest_url": "https://omi.humanpages.ai/.well-known/omi-tools.json"
+  },
+  "deleted": false
+}
