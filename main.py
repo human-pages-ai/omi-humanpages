@@ -2,12 +2,12 @@ import os
 import json
 import hmac
 import hashlib
+import aiosqlite
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta, timezone
-
-app = FastAPI(title="Human Pages for Omi", version="1.0.0")
 
 HP_BASE = os.environ.get("HP_BASE_URL", "https://humanpages.ai/api")
 HP_AGENT_KEY = os.environ.get("HP_AGENT_KEY", "")
@@ -17,6 +17,46 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OMI_APP_ID = os.environ.get("OMI_APP_ID", "")
 OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET", "hp_omi_callback_secret_min16chars")
+BASE_URL = os.environ.get("BASE_URL", "https://omi.humanpages.ai")
+DB_PATH = os.environ.get("DB_PATH", "/data/omi-hp.db")
+
+OMI_NOTIFY_URL = "https://api.omi.me/v2/integrations/{app_id}/notification"
+
+
+# --- Database ---
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                hp_id TEXT PRIMARY KEY,
+                omi_uid TEXT NOT NULL,
+                title TEXT,
+                status TEXT DEFAULT 'PENDING',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS listings (
+                hp_id TEXT PRIMARY KEY,
+                omi_uid TEXT NOT NULL,
+                title TEXT,
+                status TEXT DEFAULT 'OPEN',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Human Pages for Omi", version="1.0.0", lifespan=lifespan)
 
 
 # --- Helpers ---
@@ -29,6 +69,54 @@ async def hp_request(method: str, path: str, **kwargs) -> dict:
         resp = await client.request(method, f"{HP_BASE}{path}", headers=headers, **kwargs)
         resp.raise_for_status()
         return resp.json()
+
+
+async def notify_omi_user(uid: str, message: str):
+    """Push a notification to an Omi user."""
+    if not OMI_APP_ID:
+        return
+    url = OMI_NOTIFY_URL.format(app_id=OMI_APP_ID)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={"uid": uid, "message": message})
+    except Exception:
+        pass
+
+
+async def save_job(hp_id: str, omi_uid: str, title: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO jobs (hp_id, omi_uid, title) VALUES (?, ?, ?)",
+            (hp_id, omi_uid, title),
+        )
+        await db.commit()
+
+
+async def save_listing(hp_id: str, omi_uid: str, title: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO listings (hp_id, omi_uid, title) VALUES (?, ?, ?)",
+            (hp_id, omi_uid, title),
+        )
+        await db.commit()
+
+
+async def get_omi_uid_for_job(hp_id: str) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT omi_uid, title FROM jobs WHERE hp_id = ?", (hp_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1]) if row else None
+
+
+async def get_omi_uid_for_listing(hp_id: str) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT omi_uid, title FROM listings WHERE hp_id = ?", (hp_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1]) if row else None
 
 
 async def llm_extract_service_need(transcript: str) -> dict | None:
@@ -301,6 +389,8 @@ async def tool_listing(request: Request, uid: str = Query("")):
         "description": description,
         "budgetUsdc": budget,
         "expiresAt": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+        "callbackUrl": f"{BASE_URL}/callback/listing",
+        "callbackSecret": CALLBACK_SECRET,
     }
 
     if skills := body.get("skills"):
@@ -317,6 +407,8 @@ async def tool_listing(request: Request, uid: str = Query("")):
         return {"error": f"Failed to create listing: {error_body}"}
 
     listing_id = result.get("id", "")
+    await save_listing(listing_id, uid, title)
+
     return {
         "result": (
             f"Job listing posted on Human Pages!\n"
@@ -347,6 +439,8 @@ async def tool_hire(request: Request, uid: str = Query("")):
         "description": description,
         "priceUsdc": price,
         "agentId": OMI_APP_ID or "omi-humanpages",
+        "callbackUrl": f"{BASE_URL}/callback/job",
+        "callbackSecret": CALLBACK_SECRET,
     }
 
     try:
@@ -356,6 +450,8 @@ async def tool_hire(request: Request, uid: str = Query("")):
         return {"error": f"Failed to send offer: {error_body}"}
 
     job_id = result.get("id", "")
+    await save_job(job_id, uid, title)
+
     return {
         "result": (
             f"Job offer sent!\n"
@@ -365,6 +461,84 @@ async def tool_hire(request: Request, uid: str = Query("")):
             f"The person will be notified. I'll update you when they respond."
         )
     }
+
+
+# --- HP Callbacks (status updates pushed back to Omi user) ---
+
+STATUS_MESSAGES = {
+    "ACCEPTED": "accepted your job! Message them to confirm details.",
+    "REJECTED": "declined the job offer.",
+    "SUBMITTED": "submitted their work. Say 'approve' to complete or 'request revision' for changes.",
+    "COMPLETED": "— job marked complete!",
+    "CANCELLED": "— job was cancelled.",
+    "DISPUTED": "— a dispute was opened on this job.",
+    "PAYMENT_PENDING_CONFIRMATION": "— payment is being confirmed.",
+}
+
+
+def verify_hp_signature(body: bytes, signature: str) -> bool:
+    expected = hmac.HMAC(
+        CALLBACK_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+@app.post("/callback/job")
+async def callback_job(request: Request):
+    """HP calls this when a job status changes."""
+    body_bytes = await request.body()
+    signature = request.headers.get("X-HumanPages-Signature", "")
+
+    if CALLBACK_SECRET and signature:
+        if not verify_hp_signature(body_bytes, signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
+    data = json.loads(body_bytes)
+    job_id = data.get("id", "")
+    new_status = data.get("status", "")
+    human_name = data.get("humanName", "The provider")
+
+    lookup = await get_omi_uid_for_job(job_id)
+    if not lookup:
+        return {"ok": True}
+
+    omi_uid, title = lookup
+    msg_suffix = STATUS_MESSAGES.get(new_status, f"— status changed to {new_status}.")
+    message = f'"{title}": {human_name} {msg_suffix}'
+
+    await notify_omi_user(omi_uid, message)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE jobs SET status = ? WHERE hp_id = ?", (new_status, job_id))
+        await db.commit()
+
+    return {"ok": True}
+
+
+@app.post("/callback/listing")
+async def callback_listing(request: Request):
+    """HP calls this when someone applies to a listing."""
+    body_bytes = await request.body()
+    signature = request.headers.get("X-HumanPages-Signature", "")
+
+    if CALLBACK_SECRET and signature:
+        if not verify_hp_signature(body_bytes, signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
+    data = json.loads(body_bytes)
+    listing_id = data.get("id", data.get("listingId", ""))
+    applicant_name = data.get("applicantName", "Someone")
+    application_count = data.get("applicationCount", 0)
+
+    lookup = await get_omi_uid_for_listing(listing_id)
+    if not lookup:
+        return {"ok": True}
+
+    omi_uid, title = lookup
+    message = f'"{title}": {applicant_name} applied! ({application_count} total applicants). Say "check my listing" to review.'
+
+    await notify_omi_user(omi_uid, message)
+    return {"ok": True}
 
 
 # --- Health ---
